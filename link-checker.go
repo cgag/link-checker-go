@@ -9,7 +9,8 @@ import (
 )
 
 func main() {
-	seedUrl, err := u.Parse("http://devotter.com")
+	// seedUrl, err := u.Parse("http://devotter.com")
+	seedUrl, err := u.Parse("http://curtis.io")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,21 +31,23 @@ type TestedUrl struct {
 	status int
 }
 
-func FindLinks(url u.URL) (chan TestedUrl, chan u.URL) {
+func FindLinks(url u.URL) (chan TestedUrl, chan u.URL, chan error) {
 	links := make(chan u.URL)
 	initResponse := make(chan TestedUrl)
+	errChan := make(chan error)
 
 	go func() {
 		res, err := http.Get(url.String())
 		if err != nil {
-			log.Fatal(err)
+			errChan <- err
 		}
+
 		initResponse <- TestedUrl{*res.Request.URL, res.StatusCode}
 		close(initResponse)
 
 		doc, err := goquery.NewDocumentFromResponse(res)
 		if err != nil {
-			log.Fatal(err)
+			errChan <- err
 		}
 
 		doc.Find("a").Each(func(_ int, sel *goquery.Selection) {
@@ -58,59 +61,71 @@ func FindLinks(url u.URL) (chan TestedUrl, chan u.URL) {
 		close(links)
 	}()
 
-	return initResponse, links
+	return initResponse, links, errChan
 }
 
 func crawl(seedUrl u.URL, crawled map[u.URL]bool) chan TestedUrl {
 
 	urls := make(chan TestedUrl)
-	go func() {
-		res, links := FindLinks(seedUrl)
 
-		seedRes := <-res
-		crawled[seedUrl] = true
-		urls <- seedRes
+	res, links, errChan := FindLinks(seedUrl)
+	crawled[seedUrl] = true
+	urls <- <-res
 
-		// toTest := make(chan u.URL)
-		// testResults := make(chan TestedUrl)
+	nextRound := make([]u.URL, 0)
+	for link := range links {
+		_, alreadyCrawled := crawled[link]
+		if !alreadyCrawled {
+			nextRound = append(nextRound, link)
+		}
+	}
 
-		// go func() {
-		// 	for link := range toTest {
-		// 		testResults <- test(link)
-		// 	}
-		// }()
+	for {
+		if len(nextRound) == 0 {
+			break
+		}
 
-		for link := range links {
-			_, alreadyCrawled := crawled[link]
-			if !alreadyCrawled {
-				if isInternalLink := link.Host == seedUrl.Host; isInternalLink {
-					for u := range crawl(link, crawled) {
-						urls <- u
-					}
-				} else {
-					// internal links get checked by the recursive call to crawl
-					crawled[link] = true
-					urls <- test(link)
-					// toTest <- link
+		linkChans := make([]chan u.URL, 0)
+		for _, link := range nextRound {
+			res, linkChan := FindLinks(link)
+			crawled[link] = true
+			urls <- <-res
+
+			if isInternalLink := link.Host == seedUrl.Host; isInternalLink {
+				linkChans = append(linkChans, linkChan)
+			} else {
+				go func() { urls <- <-test(link) }()
+			}
+		}
+
+		fmt.Println("seen: ", crawled)
+		nextRound = make([]u.URL, 0)
+		for _, c := range linkChans {
+			for link := range c {
+				_, alreadyCrawled := crawled[link]
+				if !alreadyCrawled {
+					nextRound = append(nextRound, link)
 				}
 			}
 		}
-		// close(toTest)
-		// fmt.Println("closed totest")
+	}
 
-		// for tested := range testResults {
-		// 	urls <- tested
-		// }
-		close(urls)
-	}()
+	close(urls)
 
 	return urls
 }
 
-func test(url u.URL) TestedUrl {
-	res, err := http.Head(url.String())
-	if err != nil {
-		log.Fatal(err)
-	}
-	return TestedUrl{url, res.StatusCode}
+func test(url u.URL) chan TestedUrl {
+	c := make(chan TestedUrl)
+	go func() {
+		res, err := http.Head(url.String())
+		if err != nil {
+			// log.Fatal(err)
+			// return nil, err
+			u, _ := u.Parse("http://google.com")
+			c <- TestedUrl{*u, 0}
+		}
+		c <- TestedUrl{url, res.StatusCode}
+	}()
+	return c
 }
