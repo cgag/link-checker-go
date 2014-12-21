@@ -9,17 +9,16 @@ import (
 )
 
 func main() {
-	// seedUrl, err := u.Parse("http://devotter.com")
-	seedUrl, err := u.Parse("http://curtis.io")
+	seedUrl, err := u.Parse("http://devotter.com")
+	// seedUrl, err := u.Parse("http://curtis.io")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var crawledUrls = make(map[u.URL]bool)
-	crawlResults := crawl(*seedUrl, crawledUrls)
+	crawlResults := crawl(*seedUrl)
 
 	for link := range crawlResults {
-		fmt.Printf("output: %v\n", link)
+		fmt.Println("output: ", link.url, link.status)
 	}
 
 	fmt.Println("done")
@@ -27,105 +26,79 @@ func main() {
 }
 
 type TestedUrl struct {
-	url    u.URL
-	status int
+	url        u.URL
+	status     int
+	linkedUrls []u.URL
 }
 
-func FindLinks(url u.URL) (chan TestedUrl, chan u.URL, chan error) {
-	links := make(chan u.URL)
-	initResponse := make(chan TestedUrl)
-	errChan := make(chan error)
-
-	go func() {
-		res, err := http.Get(url.String())
-		if err != nil {
-			errChan <- err
-		}
-
-		initResponse <- TestedUrl{*res.Request.URL, res.StatusCode}
-		close(initResponse)
-
-		doc, err := goquery.NewDocumentFromResponse(res)
-		if err != nil {
-			errChan <- err
-		}
-
-		doc.Find("a").Each(func(_ int, sel *goquery.Selection) {
-			href, _ := sel.Attr("href")
-			parsed, err := u.Parse(href)
-			if err != nil {
-				log.Fatal(err)
-			}
-			links <- *url.ResolveReference(parsed)
-		})
-		close(links)
-	}()
-
-	return initResponse, links, errChan
-}
-
-func crawl(seedUrl u.URL, crawled map[u.URL]bool) chan TestedUrl {
-
-	urls := make(chan TestedUrl)
-
-	res, links, errChan := FindLinks(seedUrl)
-	crawled[seedUrl] = true
-	urls <- <-res
-
-	nextRound := make([]u.URL, 0)
-	for link := range links {
-		_, alreadyCrawled := crawled[link]
-		if !alreadyCrawled {
-			nextRound = append(nextRound, link)
-		}
+func FindLinks(url u.URL) (TestedUrl, error) {
+	res, err := http.Get(url.String())
+	if err != nil {
+		return TestedUrl{}, err
 	}
 
-	for {
-		if len(nextRound) == 0 {
-			break
+	doc, err := goquery.NewDocumentFromResponse(res)
+	if err != nil {
+		return TestedUrl{}, err
+	}
+
+	linkedUrls := make([]u.URL, 0)
+	doc.Find("a").Each(func(_ int, sel *goquery.Selection) {
+		href, _ := sel.Attr("href")
+		parsed, err := u.Parse(href)
+		if err != nil {
+			return
 		}
+		linkedUrls = append(linkedUrls, *url.ResolveReference(parsed))
+	})
+	return TestedUrl{url, res.StatusCode, linkedUrls}, nil
+}
 
-		linkChans := make([]chan u.URL, 0)
-		for _, link := range nextRound {
-			res, linkChan := FindLinks(link)
-			crawled[link] = true
-			urls <- <-res
+func crawl(seedUrl u.URL) chan TestedUrl {
+	retUrls := make(chan TestedUrl)
+	go func() {
+		crawled := make(map[u.URL]bool)
 
-			if isInternalLink := link.Host == seedUrl.Host; isInternalLink {
-				linkChans = append(linkChans, linkChan)
-			} else {
-				go func() { urls <- <-test(link) }()
-			}
+		fmt.Println("fetching first url")
+		tested, err := FindLinks(seedUrl)
+		fmt.Println("fetched first url")
+		if err != nil {
+			log.Fatal(err)
 		}
+		crawled[seedUrl] = true
+		fmt.Println("pushing to output")
+		retUrls <- tested
 
-		fmt.Println("seen: ", crawled)
-		nextRound = make([]u.URL, 0)
-		for _, c := range linkChans {
-			for link := range c {
-				_, alreadyCrawled := crawled[link]
-				if !alreadyCrawled {
-					nextRound = append(nextRound, link)
+		toTest := make([]u.URL, 0)
+		toTest = tested.linkedUrls
+
+		for {
+			fmt.Println("in crawl loop")
+			nextRound := make([]u.URL, 0)
+			for _, child := range toTest {
+				if _, alreadyCrawled := crawled[child]; !alreadyCrawled {
+					testedChild, err := FindLinks(child)
+					if err != nil {
+						continue
+					}
+					crawled[child] = true
+					retUrls <- testedChild
+					if shouldCrawl(seedUrl, child) {
+						nextRound = append(nextRound, testedChild.linkedUrls...)
+					}
 				}
 			}
+			if len(nextRound) == 0 {
+				break
+			}
+			toTest = nextRound
 		}
-	}
+		close(retUrls)
+	}()
 
-	close(urls)
-
-	return urls
+	return retUrls
 }
 
-func test(url u.URL) chan TestedUrl {
-	c := make(chan TestedUrl)
-	go func() {
-		res, err := http.Head(url.String())
-		if err != nil {
-			// log.Fatal(err)
-			// return nil, err
-			u, _ := u.Parse("http://google.com")
-			c <- TestedUrl{*u, 0}
-		}
-		c <- TestedUrl{url, res.StatusCode}
-	}()
-	return c
+func shouldCrawl(seedUrl u.URL, potential u.URL) bool {
+	return seedUrl.Host == potential.Host
 }
