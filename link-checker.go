@@ -3,82 +3,114 @@ package main
 import (
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
+	"log"
+	"net/http"
 	u "net/url"
 )
 
 func main() {
 	seedUrl, err := u.Parse("http://devotter.com")
 	if err != nil {
-		err.Error()
+		log.Fatal(err)
 	}
 
-	var chans = make([]chan *u.URL, 0)
 	var crawledUrls = make(map[u.URL]bool)
+	crawlResults := crawl(*seedUrl, crawledUrls)
 
-	links := FindLinks(seedUrl)
-	crawledUrls[*seedUrl] = true
-
-	for link := range links {
-		fmt.Printf("link: %v\n", link)
-		crawledUrls[*link] = true
-		if isInternalLink := link.Host == seedUrl.Host; isInternalLink {
-			moreLinks := FindLinks(link)
-			chans = append(chans, moreLinks)
-		}
-	}
-
-	for _, c := range chans {
-		for link := range c {
-			_, alreadyCrawled := crawledUrls[*link]
-			if !alreadyCrawled {
-				fmt.Printf("link: %v\n", link)
-			}
-		}
+	for link := range crawlResults {
+		fmt.Printf("output: %v\n", link)
 	}
 
 	fmt.Println("done")
 	return
 }
 
-func FindLinks(url *u.URL) chan *u.URL {
-	c := make(chan *u.URL)
+type TestedUrl struct {
+	url    u.URL
+	status int
+}
+
+func FindLinks(url u.URL) (chan TestedUrl, chan u.URL) {
+	links := make(chan u.URL)
+	initResponse := make(chan TestedUrl)
 
 	go func() {
-		doc, _ := goquery.NewDocument(url.String())
+		res, err := http.Get(url.String())
+		if err != nil {
+			log.Fatal(err)
+		}
+		initResponse <- TestedUrl{*res.Request.URL, res.StatusCode}
+		close(initResponse)
+
+		doc, err := goquery.NewDocumentFromResponse(res)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		doc.Find("a").Each(func(_ int, sel *goquery.Selection) {
 			href, _ := sel.Attr("href")
 			parsed, err := u.Parse(href)
-			if err != nil { // if only we had Maybe
-				err.Error()
+			if err != nil {
+				log.Fatal(err)
 			}
-			c <- url.ResolveReference(parsed)
+			links <- *url.ResolveReference(parsed)
 		})
-		close(c)
+		close(links)
 	}()
 
-	return c
+	return initResponse, links
 }
 
-//
+func crawl(seedUrl u.URL, crawled map[u.URL]bool) chan TestedUrl {
 
-// if IsRelative(parsed) {
-// 					parsed = url.ResolveReference(parsed)
-// 				}
-// 				_, alreadyCrawled := crawled[*parsed]
-// 				if !alreadyCrawled {
-// 					c <- parsed
-// 					crawled[*parsed] = true // bad name, we dont really crawl external links
+	urls := make(chan TestedUrl)
+	go func() {
+		res, links := FindLinks(seedUrl)
 
-// 					if parsed.Host == url.Host {
-// 						link, d := crawl(parsed, crawled)
-// 						for {
-// 							select {
-// 							case l := <-link:
-// 								c <- l
-// 							case <-d:
-// 								done <- "done"
-// 							}
-// 						}
-// 					}
-// 				}
-// 				done <- "done"
+		seedRes := <-res
+		crawled[seedUrl] = true
+		urls <- seedRes
+
+		// toTest := make(chan u.URL)
+		// testResults := make(chan TestedUrl)
+
+		// go func() {
+		// 	for link := range toTest {
+		// 		testResults <- test(link)
+		// 	}
+		// }()
+
+		for link := range links {
+			_, alreadyCrawled := crawled[link]
+			if !alreadyCrawled {
+				if isInternalLink := link.Host == seedUrl.Host; isInternalLink {
+					for u := range crawl(link, crawled) {
+						urls <- u
+					}
+				} else {
+					// internal links get checked by the recursive call to crawl
+					crawled[link] = true
+					urls <- test(link)
+					// toTest <- link
+				}
+			}
+		}
+		// close(toTest)
+		// fmt.Println("closed totest")
+
+		// for tested := range testResults {
+		// 	urls <- tested
+		// }
+		close(urls)
+	}()
+
+	return urls
+}
+
+func test(url u.URL) TestedUrl {
+	res, err := http.Head(url.String())
+	if err != nil {
+		log.Fatal(err)
+	}
+	return TestedUrl{url, res.StatusCode}
+}
